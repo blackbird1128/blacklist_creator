@@ -13,6 +13,7 @@ proof_pattern = r"((?:Goal|Lemma|Instance|Global Instance|Definition).*?)Proof\.
 proof_pattern_c : re.Pattern[str] = re.compile(proof_pattern, re.DOTALL)
 name_pattern =  r"(?:Lemma|Instance|Global Instance|Definition)\s(.*?)\:"
 name_pattern_c : re.Pattern[str] = re.compile(name_pattern,re.DOTALL)
+file_line_pattern : re.Pattern[str] = re.compile(r'.*File ".*", line \d+, characters \d+-\d+:$')
 
 def extract_proofs (text: str) -> list[Proof]:
     matches: list[re.Match[str]] =  list(proof_pattern_c.finditer(text))
@@ -42,10 +43,10 @@ def comment_proofs_until (text: str, n: int) -> str:
     return proof_pattern_c.sub(repl, text,count=n)
 
 def comment_only_unsafe(text: str, unsafe_matches: list[re.Match[str]]) -> str:
-    unsafe_set = set(id(m) for m in unsafe_matches)
-
+    unsafe_set = set(m.span() for m in unsafe_matches)
     def repl(match: re.Match[str]) -> str:
-        if id(match) in unsafe_set:
+        span = match.span()
+        if span in unsafe_set:
             before = match.group(1)
             proof = match.group(2)
             return f"{before}Proof.\n(* blacklisted *)\n(* {proof} *)Admitted."
@@ -60,10 +61,42 @@ def file_upto (m: re.Match[str],text: str):
 def file_after (m: re.Match[str], text: str):
     return text[m.end():]
 
+def remove_warning_blocks(output: str) -> str:
+    lines = output.splitlines()
+    blocks: list[list[str]] = []
+    current_block: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if file_line_pattern.match(stripped):
+            if current_block:
+                blocks.append(current_block)
+            current_block = [line]
+        else:
+            if not current_block:
+                current_block = [line]
+            else:
+                current_block.append(line)
+
+    if current_block:
+        blocks.append(current_block)
+
+    filtered_lines: list[str] = []
+    for block in blocks:
+        has_error = any("Error:" in entry for entry in block)
+        has_warning = any("Warning:" in entry for entry in block)
+
+        if has_warning and not has_error:
+            continue
+
+        filtered_lines.extend(block)
+
+    return "\n".join(filtered_lines)
+
 if __name__ == "__main__":
     safe_proofs: list[Proof] = []
     unsafe_proofs: list[Proof] = []
-    errors = []
+    errors: list[tuple[str, Proof, str]] = []
     args = parser.parse_args()
     filepath = Path(args.filename)
     filename = filepath.name
@@ -91,7 +124,8 @@ if __name__ == "__main__":
                 else:
                     proof_prop = proof[0]
                     unsafe_proofs.append(proof)                    
-                    errors.append((extract_proof_name(proof_prop), proof,rocq_sub.stderr))
+                    stderr_clean = remove_warning_blocks(rocq_sub.stderr.decode("utf-8"))
+                    errors.append((extract_proof_name(proof_prop), proof, stderr_clean))
             
         unsafe_proofs_matches = [p[2] for p in unsafe_proofs]
         unsafe_commented_doc = comment_only_unsafe(text,unsafe_proofs_matches)
@@ -99,11 +133,9 @@ if __name__ == "__main__":
             with open("logs/" + filename_without_ext + ".logs","w") as f:            
                 f.write(f"{filename}:\n")
                 for error in errors:
-                    error_str = textwrap.indent(f"{error[0]}: {error[2].decode("utf-8")}","\t")
+                    error_str = textwrap.indent(f"{error[0]}: {error[2]}","\t")
                     f.write(error_str)
         print(unsafe_commented_doc)
     else:
         print("provided path must exist")
         exit(1)
-            
-        
