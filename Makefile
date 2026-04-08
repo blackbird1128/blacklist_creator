@@ -8,19 +8,24 @@ SOURCES := $(shell rocq dep -f ../constructivisation_result/_CoqProject -sort | 
 all: blacklist.logs
 
 blacklist.logs: $(SOURCES)
-	@mkdir -p logs
-	rm logs/*.logs
-	@for file in $^ ; do \
+	@set -e; \
+	mkdir -p logs; \
+	rm -f logs/*.logs; \
+	for file in $^ ; do \
 		tmp="$$file.blacklist"; \
 		printf 'Processing %s\n' "$$file"; \
-		python3 blacklister.py "$$file" > "$$tmp"; \
+		if rocq c -Q $(THEORIES_DIR) GeoCoq -w -ambiguous-paths -w notation-overridden "$$file" > /dev/null; then \
+			printf 'Already compiles, skipping blacklist for %s\n' "$$file"; \
+			continue; \
+		fi; \
+		python3 blacklister.py --workers 12 "$$file" > "$$tmp"; \
 		mv "$$tmp" "$$file"; \
 		if ! rocq c -Q $(THEORIES_DIR) GeoCoq -w -ambiguous-paths -w notation-overridden "$$file" > /dev/null; then \
 			printf 'rocq failed on %s\n' "$$file" >&2; \
 		fi; \
-	done
+	done; \
 	cat logs/*.logs > $@
 
 clean:
-	rm blacklist.logs
-	rm logs/*.logs
+	rm -f blacklist.logs
+	rm -f logs/*.logs
