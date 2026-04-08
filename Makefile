@@ -1,7 +1,26 @@
 
 .PHONY: all
 
-all:
-	find ../geocoq_constructivisation_result/theories/Constructive/ -name "*.v" -type f | xargs  -I {} python3 blacklister.py "{}"
-	cat logs/*.logs > blacklist.logs
+CONSTRUCTIVE_DIR := ../constructivisation_result/theories/Constructive
+THEORIES_DIR := ../constructivisation_result/theories
+SOURCES := $(shell rocq dep -f ../constructivisation_result/_CoqProject -sort | tr " " "\n" | grep "Constructive")
 
+all: blacklist.logs
+
+blacklist.logs: $(SOURCES)
+	@mkdir -p logs
+	rm logs/*.logs
+	@for file in $^ ; do \
+		tmp="$$file.blacklist"; \
+		printf 'Processing %s\n' "$$file"; \
+		python3 blacklister.py "$$file" > "$$tmp"; \
+		mv "$$tmp" "$$file"; \
+		if ! rocq c -Q $(THEORIES_DIR) GeoCoq -w -ambiguous-paths -w notation-overridden "$$file" > /dev/null; then \
+			printf 'rocq failed on %s\n' "$$file" >&2; \
+		fi; \
+	done
+	cat logs/*.logs > $@
+
+clean:
+	rm blacklist.logs
+	rm logs/*.logs
