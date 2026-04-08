@@ -51,7 +51,6 @@ def comment_proofs_until (text: str, n: int) -> str:
 
 def comment_only_unsafe(text: str, unsafe_matches: list[re.Match[str]]) -> str:
     unsafe_set = set(m.span() for m in unsafe_matches)
-    print(f"unsafe set: {unsafe_set}")
     def repl(match: re.Match[str]) -> str:
         span = match.span()
         if span in unsafe_set:
