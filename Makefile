@@ -3,15 +3,17 @@
 
 CONSTRUCTIVE_DIR := ../constructivisation_result/theories/Constructive
 THEORIES_DIR := ../constructivisation_result/theories
-SOURCES := $(shell rocq dep -f ../constructivisation_result/_CoqProject -sort | tr " " "\n" | grep "Constructive")
+SOURCES_FILE := files.txt
+SOURCES_REL := $(shell cat $(SOURCES_FILE))
+SOURCES := $(addprefix ../constructivisation_result/,$(SOURCES_REL))
 
 all: blacklist.logs
 
-blacklist.logs: $(SOURCES)
+blacklist.logs: $(SOURCES_FILE) $(SOURCES)
 	@set -e; \
 	mkdir -p logs; \
 	rm -f logs/*.logs; \
-	for file in $^ ; do \
+	for file in $(SOURCES); do \
 		tmp="$$file.blacklist"; \
 		printf 'Processing %s\n' "$$file"; \
 		if rocq c -Q $(THEORIES_DIR) GeoCoq -w -ambiguous-paths -w notation-overridden "$$file" > /dev/null; then \
