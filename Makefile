@@ -1,39 +1,31 @@
-.PHONY: all clean
 
-CONSTRUCTIVE_DIR := ../constructivisation_result/theories/Constructive
-THEORIES_DIR := ../constructivisation_result/theories
-SRC_MAKEFILE := ../rocq-ditto/Makefile
-SOURCES_FILE := files.txt
+CONSTRUCTIVISATION_DIR ?= ../geocoq_constructivisation_result
+THEORIES_DIR ?= $(CONSTRUCTIVISATION_DIR)/theories
 
-all: blacklist.logs
+constructivisation_in.txt: constructivisation_pairs.txt
+	cut -d " " -f 1 $< > $@
 
-files.txt: $(SRC_MAKEFILE)
-	awk '\
-		/^constructivisation-build:/ { in_rule = 1; next } \
-		in_rule && /^[^ \t].*:/      { in_rule = 0 } \
-		in_rule { \
-			for (i = 1; i < NF; i++) \
-				if ($$i == "-o") { \
-					out = $$(i+1); \
-					sub(/^\$$\(GEOCOQ_OUTPUT_DIR\)\//, "", out); \
-					print out; \
-				} \
-		} \
-	' $< > $@
+project_sorted_files.txt: ../geocoq_constructivisation_result/_CoqProject
+	rocq dep -f $< -sort | tr " " "\n" | grep -o "theories/.*" > $@
 
-blacklist.logs: files.txt
+constructivisation_in_sorted.txt: project_sorted_files.txt constructivisation_in.txt
+	awk 'NR==FNR {order[$$0]=NR; next} ($$1 in order) {print order[$$1], $$0}' $^ \
+	| sort -n \
+	| cut -d' ' -f2- > $@
+
+blacklist.logs: project_sorted_files.txt
 	@set -e; \
 	mkdir -p logs; \
 	rm -f logs/*.logs; \
 	while IFS= read -r rel; do \
-		file="../constructivisation_result/$$rel"; \
+		file="$(CONSTRUCTIVISATION_DIR)/$$rel"; \
 		tmp="$$file.blacklist"; \
 		printf 'Processing %s\n' "$$file"; \
 		if rocq c -Q $(THEORIES_DIR) GeoCoq -w -ambiguous-paths -w notation-overridden "$$file" > /dev/null; then \
 			printf 'Already compiles, skipping blacklist for %s\n' "$$file"; \
 			continue; \
 		fi; \
-		python3 blacklister.py --workers 12 "$$file" > "$$tmp"; \
+		python3 blacklister.py --theories-dir "$(THEORIES_DIR)" --workers 12 "$$file" > "$$tmp"; \
 		mv "$$tmp" "$$file"; \
 		if ! rocq c -Q $(THEORIES_DIR) GeoCoq -w -ambiguous-paths -w notation-overridden "$$file" > /dev/null; then \
 			printf 'rocq failed on %s\n' "$$file" >&2; \
@@ -41,6 +33,7 @@ blacklist.logs: files.txt
 	done < $<; \
 	find logs -type f -name '*.logs' -exec cat {} + > $@
 
+
 clean:
-	rm -f blacklist.logs files.txt
-	rm -f logs/*.logs
+	rm -f constructivisation_in.txt
+	rm -f project_sorted_files.txt

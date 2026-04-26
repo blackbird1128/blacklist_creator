@@ -12,6 +12,7 @@ type Proof = tuple[str, str, re.Match[str]]
 
 parser = argparse.ArgumentParser(prog="blacklist maker",description="")
 parser.add_argument('filename',type=str)  # pyright: ignore[reportUnusedCallResult]
+parser.add_argument('--theories-dir', type=Path, default=None, help="Root theories directory to pass to rocq -Q")  # pyright: ignore[reportUnusedCallResult]
 parser.add_argument('--workers', type=int, default=None, help="Number of proofs to check in parallel (defaults to CPU count)")  # pyright: ignore[reportUnusedCallResult]
 proof_pattern = r"((?:Goal|Lemma|Instance|Global Instance|Definition).*?)Proof\.(.*?)(?:Qed|Admitted|Abort|Defined)\."
 proof_pattern_c : re.Pattern[str] = re.compile(proof_pattern, re.DOTALL)
@@ -164,8 +165,7 @@ if __name__ == "__main__":
     filename = filepath.name
     filename_without_ext = filepath.with_suffix("").name
     filepath_parents =  list(filepath.parents)
-    theories_dir = next(x for x in filepath_parents if x.name == "theories")
-
+    theories_dir = args.theories_dir or next(x for x in filepath_parents if x.name == "theories")
     if Path.exists(filepath):
         text = Path.read_text(filepath)
 
