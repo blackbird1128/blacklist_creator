@@ -19,6 +19,8 @@ proof_pattern_c : re.Pattern[str] = re.compile(proof_pattern, re.DOTALL)
 name_pattern =  r"(?:Lemma|Instance|Global Instance|Definition)\s(.*?)\:"
 name_pattern_c : re.Pattern[str] = re.compile(name_pattern,re.DOTALL)
 file_line_pattern : re.Pattern[str] = re.compile(r'.*File ".*", line \d+, characters \d+-\d+:$')
+UNSTABLE_GOAL_ERROR = "Could not deduce the stability of the goal"
+UNSTABLE_GOAL_COMMENT = "Can't be imported by wholesale importation (Case analysis on an unstable goal)"
 
 def extract_proofs (text: str) -> list[Proof]:
     matches: list[re.Match[str]] =  list(proof_pattern_c.finditer(text))
@@ -50,14 +52,19 @@ def comment_proofs_until (text: str, n: int) -> str:
 
     return proof_pattern_c.sub(repl, text,count=n)
 
-def comment_only_unsafe(text: str, unsafe_matches: list[re.Match[str]]) -> str:
+def comment_only_unsafe(
+    text: str,
+    unsafe_matches: list[re.Match[str]],
+    unsafe_comments: dict[tuple[int, int], str] | None = None,
+) -> str:
     unsafe_set = set(m.span() for m in unsafe_matches)
     def repl(match: re.Match[str]) -> str:
         span = match.span()
         if span in unsafe_set:
             before = match.group(1)
             proof = match.group(2)
-            return f"{before}Proof.\n(* blacklisted *)\n(* {proof} *)Admitted."
+            comment = unsafe_comments.get(span, "blacklisted") if unsafe_comments else "blacklisted"
+            return f"{before}Proof.\n(* {comment} *)\n(* {proof} *)Admitted."
         else:
             return match.group(0)  # leave unchanged
 
@@ -148,7 +155,7 @@ def process_proof(
             capture_output=True,
         )
 
-    if rocq_sub.returncode == 0 and rocq_sub.stdout == b"":
+    if rocq_sub.returncode == 0:
         return index, True, proof, None
 
     proof_prop = proof[0]
@@ -213,7 +220,12 @@ if __name__ == "__main__":
                     errors.append(error)
             
         unsafe_proofs_matches = [p[2] for p in unsafe_proofs]
-        unsafe_commented_doc = comment_only_unsafe(text,unsafe_proofs_matches)
+        unsafe_comments = {
+            proof[2].span(): UNSTABLE_GOAL_COMMENT
+            for _, proof, error_text in errors
+            if UNSTABLE_GOAL_ERROR in error_text
+        }
+        unsafe_commented_doc = comment_only_unsafe(text, unsafe_proofs_matches, unsafe_comments)
         if errors:
             with open("logs/" + filename_without_ext + ".logs","w") as f:            
                 f.write(f"{filename}:\n")
