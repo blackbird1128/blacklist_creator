@@ -8,23 +8,41 @@ import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-type Proof = tuple[str, str, re.Match[str]]
+type Proof = tuple[str, str, str, re.Match[str]]
+type RocqResult = subprocess.CompletedProcess[bytes]
 
 parser = argparse.ArgumentParser(prog="blacklist maker",description="")
 parser.add_argument('filename',type=str)  # pyright: ignore[reportUnusedCallResult]
 parser.add_argument('--theories-dir', type=Path, default=None, help="Root theories directory to pass to rocq -Q")  # pyright: ignore[reportUnusedCallResult]
 parser.add_argument('--workers', type=int, default=None, help="Number of proofs to check in parallel (defaults to CPU count)")  # pyright: ignore[reportUnusedCallResult]
-proof_pattern = r"((?:Goal|Lemma|Instance|Global Instance|Definition).*?)Proof\.(.*?)(?:Qed|Admitted|Abort|Defined)\."
-proof_pattern_c : re.Pattern[str] = re.compile(proof_pattern, re.DOTALL)
+proof_pattern = r"(^[ \t]*(?:Goal|Lemma|Global Instance|Instance|Definition)\b.*?)Proof(?:\s+using\s+[^.]*)?\.(.*?)(Qed|Admitted|Abort|Defined)\."
+proof_pattern_c : re.Pattern[str] = re.compile(proof_pattern, re.DOTALL | re.MULTILINE)
 name_pattern =  r"(?:Lemma|Instance|Global Instance|Definition)\s(.*?)\:"
 name_pattern_c : re.Pattern[str] = re.compile(name_pattern,re.DOTALL)
 file_line_pattern : re.Pattern[str] = re.compile(r'.*File ".*", line \d+, characters \d+-\d+:$')
 UNSTABLE_GOAL_ERROR = "Could not deduce the stability of the goal"
 UNSTABLE_GOAL_COMMENT = "Can't be imported by wholesale importation (Case analysis on an unstable goal)"
+TERMINATOR_COMMENT_PREFIX = "blacklister-original-terminator:"
+DECLARATION_PREFIX = r"(?:Goal|Lemma|Global Instance|Instance|Definition)"
+blacklisted_proof_pattern: re.Pattern[str] = re.compile(
+    rf"(?P<header>^[ \t]*{DECLARATION_PREFIX}\b"
+    rf"(?:(?!^[ \t]*{DECLARATION_PREFIX}\b).)*?)"
+    rf"Proof(?:\s+using\s+[^.]*)?\.\s*\n"
+    rf"(?P<comment_prefix>(?:[ \t]*\(\*(?! {re.escape(TERMINATOR_COMMENT_PREFIX)}).*?\*\)[ \t]*\n)*)"
+    rf"\(\* {re.escape(TERMINATOR_COMMENT_PREFIX)} "
+    rf"(?P<terminator>Qed|Admitted|Abort|Defined) \*\)\s*\n"
+    rf"\(\* (?P<proof>.*?) \*\)Admitted\.",
+    re.DOTALL | re.MULTILINE,
+)
+terminator_comment_pattern: re.Pattern[str] = re.compile(
+    rf"^[ \t]*\(\* {re.escape(TERMINATOR_COMMENT_PREFIX)} "
+    rf"(?:Qed|Admitted|Abort|Defined) \*\)[ \t]*\n",
+    re.MULTILINE,
+)
 
 def extract_proofs (text: str) -> list[Proof]:
     matches: list[re.Match[str]] =  list(proof_pattern_c.finditer(text))
-    return [(m.groups()[0].lstrip(),m.groups()[1],m) for m in matches if not (m.groups()[1].strip().startswith("(*"))]
+    return [(m.groups()[0].lstrip(), m.groups()[1], m.groups()[2], m) for m in matches if not (m.groups()[1].strip().startswith("(*"))]
 
 def extract_proof_name (proof_prop: str) -> str:
   matches: list[str] = name_pattern_c.findall(proof_prop)
@@ -33,24 +51,25 @@ def extract_proof_name (proof_prop: str) -> str:
   else:
       return matches[0].strip()
 
+def proof_stub(
+    match: re.Match[str],
+    comment: str | None = None,
+) -> str:
+    comments = []
+    if comment:
+        comments.append(f"(* {comment} *)")
+    comments.append(f"(* {TERMINATOR_COMMENT_PREFIX} {match.group(3)} *)")
+    comments.append(f"(* {match.group(2)} *)Admitted.")
+    return f"{match.group(1)}Proof.\n" + "\n".join(comments)
+
 def comment_proofs (text: str) -> str:
-    def repl(match: re.Match[str]) -> str:
-        before = match.group(1)
-        proof = match.group(2)
-        return f"{before}Proof. (* {proof}*)Admitted."
-    
-    return proof_pattern_c.sub(repl, text)
+    return proof_pattern_c.sub(lambda match: proof_stub(match), text)
 
 def comment_proofs_until (text: str, n: int) -> str:
     if n <= 0:
         return text
 
-    def repl(match: re.Match[str]) -> str:
-        before = match.group(1)
-        proof = match.group(2)
-        return f"{before}Proof. (* {proof}*)Admitted."
-
-    return proof_pattern_c.sub(repl, text,count=n)
+    return proof_pattern_c.sub(lambda match: proof_stub(match), text, count=n)
 
 def comment_only_unsafe(
     text: str,
@@ -61,10 +80,8 @@ def comment_only_unsafe(
     def repl(match: re.Match[str]) -> str:
         span = match.span()
         if span in unsafe_set:
-            before = match.group(1)
-            proof = match.group(2)
             comment = unsafe_comments.get(span, "blacklisted") if unsafe_comments else "blacklisted"
-            return f"{before}Proof.\n(* {comment} *)\n(* {proof} *)Admitted."
+            return proof_stub(match, comment)
         else:
             return match.group(0)  # leave unchanged
 
@@ -118,28 +135,22 @@ def update_progress(current: int, total: int) -> None:
     sys.stderr.flush()
 
 
-def process_proof(
-    index: int,
-    proof: Proof,
+def run_rocq_on_text(
     text: str,
     filename_without_ext: str,
     theories_dir: Path,
-) -> tuple[int, bool, Proof, tuple[str, Proof, str] | None]:
-    upto_doc = file_upto(proof[2], text)
-    after_doc = file_after(proof[2], text)
-    commented_uptodoc = comment_proofs_until(upto_doc, index)
-    commented_afterdoc = comment_proofs(after_doc)
-
+    capture_output: bool,
+) -> RocqResult:
     with tempfile.NamedTemporaryFile(
         mode="w",
         delete_on_close=True,
         suffix=".v",
         prefix=filename_without_ext,
     ) as fp:
-        _ = fp.write(commented_uptodoc + commented_afterdoc)
+        _ = fp.write(text)
         fp.flush()
 
-        rocq_sub = subprocess.run(
+        return subprocess.run(
             [
                 "rocq",
                 "c",
@@ -152,8 +163,103 @@ def process_proof(
                 "notation-overridden",
                 fp.name,
             ],
-            capture_output=True,
+            capture_output=capture_output,
+            stdout=None if capture_output else subprocess.DEVNULL,
+            stderr=None if capture_output else subprocess.DEVNULL,
+            check=False,
         )
+
+def compile_text(text: str, filename_without_ext: str, theories_dir: Path) -> bool:
+    result = run_rocq_on_text(
+        text,
+        filename_without_ext,
+        theories_dir,
+        capture_output=False,
+    )
+    return result.returncode == 0
+
+
+def restore_blacklisted_proof(match: re.Match[str]) -> str:
+    return (
+        f"{match.group('header')}"
+        f"Proof.{match.group('proof')}"
+        f"{match.group('terminator')}."
+    )
+
+
+def replace_span(text: str, span: tuple[int, int], replacement: str) -> str:
+    start, end = span
+    return text[:start] + replacement + text[end:]
+
+
+def cleanup_pass(
+    text: str,
+    filename_without_ext: str,
+    theories_dir: Path,
+) -> tuple[str, list[str]]:
+    restored_names: list[str] = []
+    search_start = 0
+
+    while True:
+        match = blacklisted_proof_pattern.search(text, search_start)
+        if not match:
+            break
+
+        name = extract_proof_name(match.group("header"))
+        restored = restore_blacklisted_proof(match)
+        candidate = replace_span(text, match.span(), restored)
+
+        if compile_text(candidate, filename_without_ext, theories_dir):
+            text = candidate
+            restored_names.append(name)
+            search_start = match.start() + len(restored)
+            print(f"restored {name}", file=sys.stderr)
+        else:
+            search_start = match.end()
+            print(f"kept blacklisted {name}", file=sys.stderr)
+
+    return text, restored_names
+
+
+def cleanup_blacklisted_proofs(
+    text: str,
+    filename_without_ext: str,
+    theories_dir: Path,
+) -> tuple[str, set[str]]:
+    pass_number = 0
+    restored_names: set[str] = set()
+
+    while True:
+        pass_number += 1
+        print(f"cleanup pass {pass_number}", file=sys.stderr)
+        text, pass_restored_names = cleanup_pass(text, filename_without_ext, theories_dir)
+        restored_names.update(pass_restored_names)
+
+        if not pass_restored_names:
+            break
+
+    return terminator_comment_pattern.sub("", text), restored_names
+
+
+def process_proof(
+    index: int,
+    proof: Proof,
+    text: str,
+    filename_without_ext: str,
+    theories_dir: Path,
+) -> tuple[int, bool, Proof, tuple[str, Proof, str] | None]:
+    upto_doc = file_upto(proof[3], text)
+    after_doc = file_after(proof[3], text)
+    commented_uptodoc = comment_proofs_until(upto_doc, index)
+    commented_afterdoc = comment_proofs(after_doc)
+    test_doc = commented_uptodoc + commented_afterdoc
+
+    rocq_sub = run_rocq_on_text(
+        test_doc,
+        filename_without_ext,
+        theories_dir,
+        capture_output=True,
+    )
 
     if rocq_sub.returncode == 0:
         return index, True, proof, None
@@ -163,10 +269,46 @@ def process_proof(
     error = (extract_proof_name(proof_prop), proof, stderr_clean)
     return index, False, proof, error
 
-if __name__ == "__main__":
-    safe_proofs: list[Proof] = []
+
+def collect_results(
+    proof_results: list[tuple[bool, Proof, tuple[str, Proof, str] | None] | None],
+) -> tuple[list[Proof], list[tuple[str, Proof, str]]]:
     unsafe_proofs: list[Proof] = []
     errors: list[tuple[str, Proof, str]] = []
+
+    for result in proof_results:
+        if result is None:
+            continue
+
+        is_safe, proof, error = result
+        if not is_safe:
+            unsafe_proofs.append(proof)
+            if error:
+                errors.append(error)
+
+    return unsafe_proofs, errors
+
+
+def write_errors_log(
+    filename: str,
+    filename_without_ext: str,
+    errors: list[tuple[str, Proof, str]],
+) -> None:
+    log_path = Path("logs") / f"{filename_without_ext}.logs"
+
+    if not errors:
+        if log_path.exists():
+            log_path.unlink()
+        return
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w") as f:
+        f.write(f"{filename}:\n")
+        for error in errors:
+            error_str = textwrap.indent(f"{error[0]}: {error[2]}", "\t")
+            f.write(error_str)
+
+if __name__ == "__main__":
     args = parser.parse_args()
     filepath = Path(args.filename)
     filename = filepath.name
@@ -208,31 +350,27 @@ if __name__ == "__main__":
 
             sys.stderr.write("\n")
 
-        for result in proof_results:
-            if result is None:
-                continue
-            is_safe, proof, error = result
-            if is_safe:
-                safe_proofs.append(proof)
-            else:
-                unsafe_proofs.append(proof)
-                if error:
-                    errors.append(error)
-            
-        unsafe_proofs_matches = [p[2] for p in unsafe_proofs]
+        unsafe_proofs, errors = collect_results(proof_results)
+        unsafe_proofs_matches = [p[3] for p in unsafe_proofs]
         unsafe_comments = {
-            proof[2].span(): UNSTABLE_GOAL_COMMENT
+            proof[3].span(): UNSTABLE_GOAL_COMMENT
             for _, proof, error_text in errors
             if UNSTABLE_GOAL_ERROR in error_text
         }
         unsafe_commented_doc = comment_only_unsafe(text, unsafe_proofs_matches, unsafe_comments)
-        if errors:
-            with open("logs/" + filename_without_ext + ".logs","w") as f:            
-                f.write(f"{filename}:\n")
-                for error in errors:
-                    error_str = textwrap.indent(f"{error[0]}: {error[2]}","\t")
-                    f.write(error_str)
+        if filename.startswith("Ch14"):
+            unsafe_commented_doc, restored_names = cleanup_blacklisted_proofs(
+                unsafe_commented_doc,
+                filename_without_ext,
+                theories_dir,
+            )
+            errors = [
+                error
+                for error in errors
+                if error[0] not in restored_names
+            ]
+        
+        write_errors_log(filename, filename_without_ext, errors)
         print(unsafe_commented_doc)
     else:
-        print("provided path must exist")
         exit(1)
