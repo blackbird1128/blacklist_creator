@@ -228,15 +228,15 @@ def cleanup_blacklisted_proofs(
 ) -> tuple[str, set[str]]:
     pass_number = 0
     restored_names: set[str] = set()
+    # For now, only one pass is needed, speed up a bit
+    # while True:
+    #     pass_number += 1
+    #     print(f"cleanup pass {pass_number}", file=sys.stderr)
+    text, pass_restored_names = cleanup_pass(text, filename_without_ext, theories_dir)
+    restored_names.update(pass_restored_names)
 
-    while True:
-        pass_number += 1
-        print(f"cleanup pass {pass_number}", file=sys.stderr)
-        text, pass_restored_names = cleanup_pass(text, filename_without_ext, theories_dir)
-        restored_names.update(pass_restored_names)
-
-        if not pass_restored_names:
-            break
+    # if not pass_restored_names:
+    #     break
 
     return terminator_comment_pattern.sub("", text), restored_names
 
