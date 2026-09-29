@@ -25,7 +25,7 @@ blacklist.logs: project_sorted_files.txt
 			printf 'Already compiles, skipping blacklist for %s\n' "$$file"; \
 			continue; \
 		fi; \
-		python3 blacklister.py --theories-dir "$(THEORIES_DIR)" --workers 12 "$$file" > "$$tmp"; \
+		python3 blacklister.py --theories-dir "$(THEORIES_DIR)" --workers 18 "$$file" > "$$tmp"; \
 		mv "$$tmp" "$$file"; \
 		if ! rocq c -Q $(THEORIES_DIR) GeoCoq -w -ambiguous-paths -w notation-overridden "$$file" > /dev/null; then \
 			printf 'rocq failed on %s\n' "$$file" >&2; \
@@ -33,7 +33,24 @@ blacklist.logs: project_sorted_files.txt
 	done < $<; \
 	find logs -type f -name '*.logs' -exec cat {} + > $@
 
+blacklist_without_stab_err.logs: blacklist.logs
+	awk '\
+	/^[[:space:]]*[^:]+: File ".*", line [0-9]+, characters [0-9]+-[0-9]+:$$/ {\
+		header = $$0;\
+		if (getline err) {\
+			if (err ~ /^[[:space:]]*Error: Tactic failure: Could not deduce the stability of the goal.*\.$$/)\
+				next;\
+			print header;\
+			print err;\
+			next;\
+		}\
+		print header;\
+		next;\
+	}\
+	{ print }' $< > $@
 
 clean:
 	rm -f constructivisation_in.txt
 	rm -f project_sorted_files.txt
+	rm -f blacklist.logs
+	rm -f blacklist_without_stab_err.logs
