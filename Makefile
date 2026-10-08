@@ -25,7 +25,7 @@ blacklist.logs: project_sorted_files.txt
 			printf 'Already compiles, skipping blacklist for %s\n' "$$file"; \
 			continue; \
 		fi; \
-		python3 blacklister.py --theories-dir "$(THEORIES_DIR)" --workers 18 "$$file" > "$$tmp"; \
+		python3 blacklister.py --theories-dir "$(THEORIES_DIR)" --workers 6 "$$file" > "$$tmp"; \
 		mv "$$tmp" "$$file"; \
 		if ! rocq c -Q $(THEORIES_DIR) GeoCoq -w -ambiguous-paths -w notation-overridden "$$file" > /dev/null; then \
 			printf 'rocq failed on %s\n' "$$file" >&2; \
