@@ -6,15 +6,40 @@ import sys
 import tempfile
 import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
-type Proof = tuple[str, str, str, re.Match[str]]
+
+@dataclass(frozen=True)
+class SourceMatch:
+    """A match over masked source whose groups return the original text."""
+
+    text: str
+    match: re.Match[str]
+
+    def group(self, group: int = 0) -> str:
+        start, end = self.match.span(group)
+        return self.text[start:end]
+
+    def span(self) -> tuple[int, int]:
+        return self.match.span()
+
+    def start(self) -> int:
+        return self.match.start()
+
+    def end(self) -> int:
+        return self.match.end()
+
+
+type ProofMatch = re.Match[str] | SourceMatch
+type Proof = tuple[str, str, str, ProofMatch]
 type RocqResult = subprocess.CompletedProcess[bytes]
 
 parser = argparse.ArgumentParser(prog="blacklist maker",description="")
 parser.add_argument('filename',type=str)  # pyright: ignore[reportUnusedCallResult]
 parser.add_argument('--theories-dir', type=Path, default=None, help="Root theories directory to pass to rocq -Q")  # pyright: ignore[reportUnusedCallResult]
 parser.add_argument('--workers', type=int, default=None, help="Number of proofs to check in parallel (defaults to CPU count)")  # pyright: ignore[reportUnusedCallResult]
+parser.add_argument('--post', action='store_true', help="Retry all proofs, including stored blacklisted bodies (requires saved original terminators)")
 proof_pattern = r"(^[ \t]*(?:Goal|Lemma|Global Instance|Instance|Definition)\b.*?)Proof(?:\s+using\s+[^.]*)?\.(.*?)(Qed|Admitted|Abort|Defined)\."
 proof_pattern_c : re.Pattern[str] = re.compile(proof_pattern, re.DOTALL | re.MULTILINE)
 name_pattern =  r"(?:Lemma|Instance|Global Instance|Definition)\s(.*?)\:"
@@ -24,6 +49,11 @@ UNSTABLE_GOAL_ERROR = "Could not deduce the stability of the goal"
 UNSTABLE_GOAL_COMMENT = "Can't be imported by wholesale importation (Case analysis on an unstable goal)"
 TERMINATOR_COMMENT_PREFIX = "blacklister-original-terminator:"
 DECLARATION_PREFIX = r"(?:Goal|Lemma|Global Instance|Instance|Definition)"
+post_proof_pattern: re.Pattern[str] = re.compile(
+    rf"(^[ \t]*{DECLARATION_PREFIX}\b(?:(?!^[ \t]*{DECLARATION_PREFIX}\b).)*?)"
+    r"Proof(?:\s+using\s+[^.]*)?\.(.*?)(Qed|Admitted|Abort|Defined)\.",
+    re.DOTALL | re.MULTILINE,
+)
 blacklisted_proof_pattern: re.Pattern[str] = re.compile(
     rf"(?P<header>^[ \t]*{DECLARATION_PREFIX}\b"
     rf"(?:(?!^[ \t]*{DECLARATION_PREFIX}\b).)*?)"
@@ -44,6 +74,89 @@ def extract_proofs (text: str) -> list[Proof]:
     matches: list[re.Match[str]] =  list(proof_pattern_c.finditer(text))
     return [(m.groups()[0].lstrip(), m.groups()[1], m.groups()[2], m) for m in matches if not (m.groups()[1].strip().startswith("(*"))]
 
+
+def mask_comments(text: str) -> tuple[str, list[tuple[int, int]]]:
+    """Hide nested Rocq comments and strings while preserving source offsets."""
+    masked = list(text)
+    comments: list[tuple[int, int]] = []
+    index = 0
+    while index < len(text):
+        start = index
+        if text.startswith('(*', index):
+            depth = 1
+            index += 2
+            while index < len(text) and depth:
+                if text.startswith('(*', index):
+                    depth += 1
+                    index += 2
+                elif text.startswith('*)', index):
+                    depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            if depth:
+                raise ValueError("Unterminated Rocq comment")
+            comments.append((start, index))
+        elif text[index] == '"':
+            index += 1
+            while index < len(text):
+                if text.startswith('""', index):
+                    index += 2
+                elif text[index] == '"':
+                    index += 1
+                    break
+                else:
+                    index += 1
+        else:
+            index += 1
+            continue
+        for position in range(start, index):
+            if text[position] not in '\r\n':
+                masked[position] = ' '
+    return ''.join(masked), comments
+
+
+def prepare_post_text(text: str) -> str:
+    """Recover stored proof bodies before running the normal blacklist checks."""
+    masked, comments = mask_comments(text)
+    replacements: list[tuple[tuple[int, int], str]] = []
+    for match in post_proof_pattern.finditer(masked):
+        if match.group(3) != 'Admitted' or match.group(2).strip():
+            continue
+        start, end = match.span(2)
+        body_comments = [(a, b) for a, b in comments if start <= a and b <= end]
+        if not body_comments:
+            continue
+        terminator: str | None = None
+        for a, b in body_comments[:-1]:
+            metadata = re.fullmatch(
+                rf'\(\* {re.escape(TERMINATOR_COMMENT_PREFIX)} (Qed|Admitted|Abort|Defined) \*\)',
+                text[a:b],
+            )
+            if metadata:
+                terminator = metadata.group(1)
+        if terminator is None:
+            name = extract_proof_name(text[match.start(1):match.end(1)])
+            raise ValueError(f"Cannot retry blacklisted proof {name!r}: missing valid {TERMINATOR_COMMENT_PREFIX} metadata")
+        a, b = body_comments[-1]
+        # proof_stub adds one space on either side of the stored body.
+        body = text[a + 2:b - 2]
+        if body.startswith(' ') and body.endswith(' '):
+            body = body[1:-1]
+        replacements.append(((start, match.end()), body + terminator + '.'))
+    for span, replacement in reversed(replacements):
+        text = replace_span(text, span, replacement)
+    return text
+
+
+def extract_post_proofs(text: str) -> list[Proof]:
+    masked, _ = mask_comments(text)
+    proofs: list[Proof] = []
+    for match in post_proof_pattern.finditer(masked):
+        original = SourceMatch(text, match)
+        proofs.append((original.group(1).lstrip(), original.group(2), original.group(3), original))
+    return proofs
+
 def extract_proof_name (proof_prop: str) -> str:
   matches: list[str] = name_pattern_c.findall(proof_prop)
   if matches == []:
@@ -52,7 +165,7 @@ def extract_proof_name (proof_prop: str) -> str:
       return matches[0].strip()
 
 def proof_stub(
-    match: re.Match[str],
+    match: ProofMatch,
     comment: str | None = None,
 ) -> str:
     comments = []
@@ -71,9 +184,20 @@ def comment_proofs_until (text: str, n: int) -> str:
 
     return proof_pattern_c.sub(lambda match: proof_stub(match), text, count=n)
 
+
+def comment_selected_proofs(
+    text: str,
+    matches: list[ProofMatch],
+    comments: dict[tuple[int, int], str] | None = None,
+) -> str:
+    for match in sorted(matches, key=lambda m: m.start(), reverse=True):
+        comment = comments.get(match.span(), 'blacklisted') if comments else 'blacklisted'
+        text = replace_span(text, match.span(), proof_stub(match, comment))
+    return text
+
 def comment_only_unsafe(
     text: str,
-    unsafe_matches: list[re.Match[str]],
+    unsafe_matches: list[ProofMatch],
     unsafe_comments: dict[tuple[int, int], str] | None = None,
 ) -> str:
     unsafe_set = set(m.span() for m in unsafe_matches)
@@ -87,10 +211,10 @@ def comment_only_unsafe(
 
     return proof_pattern_c.sub(repl, text)
     
-def file_upto (m: re.Match[str],text: str):
+def file_upto (m: ProofMatch,text: str):
    return text[0:m.end()]
 
-def file_after (m: re.Match[str], text: str):
+def file_after (m: ProofMatch, text: str):
     return text[m.end():]
 
 def remove_warning_blocks(output: str) -> str:
@@ -238,7 +362,7 @@ def cleanup_blacklisted_proofs(
     # if not pass_restored_names:
     #     break
 
-    return terminator_comment_pattern.sub("", text), restored_names
+    return text, restored_names
 
 
 def process_proof(
@@ -247,12 +371,16 @@ def process_proof(
     text: str,
     filename_without_ext: str,
     theories_dir: Path,
+    post_proofs: list[Proof] | None = None,
 ) -> tuple[int, bool, Proof, tuple[str, Proof, str] | None]:
-    upto_doc = file_upto(proof[3], text)
-    after_doc = file_after(proof[3], text)
-    commented_uptodoc = comment_proofs_until(upto_doc, index)
-    commented_afterdoc = comment_proofs(after_doc)
-    test_doc = commented_uptodoc + commented_afterdoc
+    if post_proofs is not None:
+        test_doc = comment_selected_proofs(text, [p[3] for i, p in enumerate(post_proofs) if i != index])
+    else:
+        upto_doc = file_upto(proof[3], text)
+        after_doc = file_after(proof[3], text)
+        commented_uptodoc = comment_proofs_until(upto_doc, index)
+        commented_afterdoc = comment_proofs(after_doc)
+        test_doc = commented_uptodoc + commented_afterdoc
 
     rocq_sub = run_rocq_on_text(
         test_doc,
@@ -318,7 +446,12 @@ if __name__ == "__main__":
     if Path.exists(filepath):
         text = Path.read_text(filepath)
 
-        proofs = extract_proofs(text)
+        if args.post:
+            try:
+                text = prepare_post_text(text)
+            except ValueError as error:
+                parser.exit(1, f"{filepath}: {error}\n")
+        proofs = extract_post_proofs(text) if args.post else extract_proofs(text)
         total_proofs = len(proofs)
         proof_results: list[tuple[bool, Proof, tuple[str, Proof, str] | None] | None] = [None] * total_proofs
 
@@ -337,6 +470,7 @@ if __name__ == "__main__":
                         text,
                         filename_without_ext,
                         theories_dir,
+                        proofs if args.post else None,
                     )
                     for i, proof in enumerate(proofs)
                 ]
@@ -357,8 +491,12 @@ if __name__ == "__main__":
             for _, proof, error_text in errors
             if UNSTABLE_GOAL_ERROR in error_text
         }
-        unsafe_commented_doc = comment_only_unsafe(text, unsafe_proofs_matches, unsafe_comments)
-        if filename.startswith("Ch14"):
+        unsafe_commented_doc = (
+            comment_selected_proofs(text, unsafe_proofs_matches, unsafe_comments)
+            if args.post else comment_only_unsafe(text, unsafe_proofs_matches, unsafe_comments)
+        )
+        # Post mode already retries every proof; keep metadata for future retries.
+        if filename.startswith("Ch14") and not args.post:
             unsafe_commented_doc, restored_names = cleanup_blacklisted_proofs(
                 unsafe_commented_doc,
                 filename_without_ext,
@@ -371,6 +509,9 @@ if __name__ == "__main__":
             ]
         
         write_errors_log(filename, filename_without_ext, errors)
-        print(unsafe_commented_doc)
+        if args.post:
+            sys.stdout.write(unsafe_commented_doc)
+        else:
+            print(unsafe_commented_doc)
     else:
         exit(1)

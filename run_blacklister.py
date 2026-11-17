@@ -33,6 +33,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Forwarded to blacklister.py when it is invoked.",
     )
+    parser.add_argument(
+        "--post",
+        action="store_true",
+        help="Retry all proofs in selected files, including previously blacklisted proofs, even when the file already compiles.",
+    )
     return parser.parse_args()
 
 
@@ -137,12 +142,15 @@ def run_blacklister(
     target_file: Path,
     workers: int | None,
     script_dir: Path,
+    post: bool = False,
 ) -> None:
     ensure_parent(target_file)
 
     command = [sys.executable, str(script_dir / "blacklister.py")]
     if workers is not None:
         command.extend(["--workers", str(workers)])
+    if post:
+        command.append("--post")
     command.append(str(source_file))
 
     result = subprocess.run(
@@ -188,10 +196,10 @@ def main() -> int:
 
         if not is_blacklisted(relative_file, blacklist):
             shutil.copy2(source_file, target_file)
-        elif rocq_typechecks(source_file, rocq_flags, project_root):
+        elif not args.post and rocq_typechecks(source_file, rocq_flags, project_root):
             shutil.copy2(source_file, target_file)
         else:
-            run_blacklister(source_file, target_file, args.workers, script_dir)
+            run_blacklister(source_file, target_file, args.workers, script_dir, post=args.post)
 
         
         rocq_compile(target_file.relative_to(output_dir), rocq_flags, output_dir)
