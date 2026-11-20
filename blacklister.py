@@ -40,6 +40,7 @@ parser.add_argument('filename',type=str)  # pyright: ignore[reportUnusedCallResu
 parser.add_argument('--theories-dir', type=Path, default=None, help="Root theories directory to pass to rocq -Q")  # pyright: ignore[reportUnusedCallResult]
 parser.add_argument('--workers', type=int, default=None, help="Number of proofs to check in parallel (defaults to CPU count)")  # pyright: ignore[reportUnusedCallResult]
 parser.add_argument('--post', action='store_true', help="Retry all proofs, including stored blacklisted bodies (requires saved original terminators)")
+parser.add_argument('--log-file', type=Path, help="Path for proof diagnostics (defaults to logs/<filename>.logs)")
 proof_pattern = r"(^[ \t]*(?:Goal|Lemma|Global Instance|Instance|Definition)\b.*?)Proof(?:\s+using\s+[^.]*)?\.(.*?)(Qed|Admitted|Abort|Defined)\."
 proof_pattern_c : re.Pattern[str] = re.compile(proof_pattern, re.DOTALL | re.MULTILINE)
 name_pattern =  r"(?:Lemma|Instance|Global Instance|Definition)\s(.*?)\:"
@@ -419,11 +420,9 @@ def collect_results(
 
 def write_errors_log(
     filename: str,
-    filename_without_ext: str,
+    log_path: Path,
     errors: list[tuple[str, Proof, str]],
 ) -> None:
-    log_path = Path("logs") / f"{filename_without_ext}.logs"
-
     if not errors:
         if log_path.exists():
             log_path.unlink()
@@ -508,7 +507,8 @@ if __name__ == "__main__":
                 if error[0] not in restored_names
             ]
         
-        write_errors_log(filename, filename_without_ext, errors)
+        log_path = args.log_file or Path("logs") / f"{filename_without_ext}.logs"
+        write_errors_log(filename, log_path, errors)
         if args.post:
             sys.stdout.write(unsafe_commented_doc)
         else:
